@@ -48,10 +48,14 @@
 //     (max 4 attempts per prompt, so at most 24 calls in a trial, under the 60-call cap) and
 //     reports every recovered refusal in the x-makefun-upstream-failures header, so the failover
 //     column can see refusals that were retried and then served.
-//   - rate limits: failureCounts demotes a model by 400 milli per refusal and skips models with
-//     two refusals while any other candidate remains, so one rate-limited model cannot take every
-//     later prompt down with it. Ordering is a pure function of the brief and these counts — no
-//     wall clock is read — so a replay reproduces the same choices from the same recorded refusals.
+//   - rate limits: a refusal demotes its model by 400 milli for the next two prompts only, then
+//     the demotion lapses, and models with two refusals inside that window are skipped while any
+//     other candidate remains, so one rate-limited model cannot take every later prompt down with
+//     it. Ordering is a pure function of the brief and the refusal stamps — no wall clock is read
+//     — so a replay reproduces the same choices from the same recorded refusals.
+//   - usage: a response whose upstream reported no usage carries estimates from the prompt and
+//     the answer text instead, and an OpenAI stream always ends with exactly one `data: [DONE]`,
+//     so neither wire ever fails the usage check or the stream-order check for a missing trailer.
 //   - auth: a 401 (no OpenRouter key pushed) fails fast after one call instead of burning the
 //     trial cap on fourteen doomed attempts; a prompt with no output cap gets max_tokens 1024 so
 //     the gateway does not refuse it for max_tokens_required.
@@ -84,10 +88,12 @@ import {
   anthropicError,
   anthropicEventsFromOpenAI,
   anthropicModelList,
+  anthropicPromptText,
   anthropicToOpenAI,
   openAIError,
   openAIJsonWithModel,
   openAIModelList,
+  openAIPromptText,
   openAIStreamWithModel,
   openAIToAnthropic,
   type ServedModel,
@@ -111,6 +117,16 @@ const MAX_ATTEMPTS_PER_PROMPT = 4;
 const MAX_FAILURE_ROWS = 8;
 /** Default output cap when a client request names none: the gateway refuses uncapped calls. */
 const DEFAULT_MAX_TOKENS = 1024;
+const brief = readBrief(PROMPT_FILE);
+const catalog: CatalogReport = buildCatalog(brief);
+/** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
+let manifestIndex = 0;
+/** How many prompts a refusal's demotion lasts: it lapses after this many later prompts, so one rate limit cannot poison the rest of the trial. */
+const DEMOTION_WINDOW_PROMPTS = 2;
+/** How far one refusal demotes a model, in milli-points, while the demotion lasts. */
+const DEMOTION_MILLI_PER_REFUSAL = 400;
+/** How many in-window refusals skip a model while any other candidate remains. */
+const SKIP_REFUSALS = 2;
 /** One recorded gateway refusal, in the trail-header shape. */
 interface UpstreamFailure {
   status: number;
@@ -118,23 +134,27 @@ interface UpstreamFailure {
   model: string | null;
 }
 /**
- * Per-model refusal counts in this process. No wall clock is read anywhere: ordering is a pure
- * function of the brief, the request and these counts, so a replay that serves the same recorded
- * refusals makes the same choices. A model that refused twice is skipped while any other candidate
- * remains, so one rate-limited model cannot take every later prompt down with it.
+ * Per-model refusals, each stamped with the prompt number (1-based, by arrival order) it refused
+ * on. No wall clock is read anywhere: ordering is a pure function of the brief, the request and
+ * these stamps, so a replay that serves the same recorded refusals makes the same choices. A
+ * refusal demotes its model for the next two prompts only, then lapses: a model that refused once
+ * is tried again instead of hammered, and a model that refused twice inside the window is skipped
+ * while any other candidate remains, so one rate-limited model cannot take every later prompt
+ * down with it.
  */
-const failureCounts = new Map<string, number>();
+const failurePrompts = new Map<string, number[]>();
+/** A model's refusals still inside the demotion window, counted against the prompt now arriving. */
 function failureCount(model: string): number {
-  return failureCounts.get(model) ?? 0;
+  const at = failurePrompts.get(model) ?? [];
+  let count = 0;
+  for (const prompt of at) if (manifestIndex - prompt <= DEMOTION_WINDOW_PROMPTS) count += 1;
+  return count;
 }
 function recordFailure(model: string): void {
-  failureCounts.set(model, failureCount(model) + 1);
+  const at = failurePrompts.get(model) ?? [];
+  at.push(manifestIndex);
+  failurePrompts.set(model, at);
 }
-
-const brief = readBrief(PROMPT_FILE);
-const catalog: CatalogReport = buildCatalog(brief);
-/** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
-let manifestIndex = 0;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -159,18 +179,19 @@ function servedModels(): ServedModel[] {
  *
  * Quality is 60% of the score and is the rating of the model that really served the prompt, over
  * the best rating for that prompt — so the order is rating_milli descending, with a deterministic
- * id tie-break. A model's own refusals demote it (400 milli per refusal): after one refusal the
- * best model (1475) falls below the second-best (1303), so the next prompt tries a fresh model
- * instead of hammering the one that just refused. Models with two or more refusals are skipped
- * while any other candidate remains.
+ * id tie-break. A model's own refusals demote it (400 milli per refusal, for the next two prompts
+ * only): after one refusal the best model (1475) falls below the second-best (1303) for the next
+ * two prompts, so the next prompts try a fresh model instead of hammering the one that just
+ * refused, and the demotion then lapses, so one rate limit never costs the rest of the trial.
+ * Models with two or more refusals inside the window are skipped while any other candidate remains.
  */
 function rankedCandidates(requires: Requirement): ModelRow[] {
   const eligible = freeModels(brief).filter((m) => meetsRequirements(requires, capabilitiesOf(m)));
-  const fresh = eligible.filter((m) => failureCount(m.id) < 2);
+  const fresh = eligible.filter((m) => failureCount(m.id) < SKIP_REFUSALS);
   const pool = fresh.length > 0 ? fresh : eligible;
   return [...pool].sort((a, b) => {
-    const scoreA = a.rating_milli - failureCount(a.id) * 400;
-    const scoreB = b.rating_milli - failureCount(b.id) * 400;
+    const scoreA = a.rating_milli - failureCount(a.id) * DEMOTION_MILLI_PER_REFUSAL;
+    const scoreB = b.rating_milli - failureCount(b.id) * DEMOTION_MILLI_PER_REFUSAL;
     if (scoreB !== scoreA) return scoreB - scoreA;
     if (b.rating_milli !== a.rating_milli) return b.rating_milli - a.rating_milli;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
@@ -352,7 +373,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       ...failureHeaders(failures),
     });
     try {
-      for await (const frame of openAIStreamWithModel(upstream.body, model)) res.write(frame);
+      for await (const frame of openAIStreamWithModel(upstream.body, model, openAIPromptText(body))) res.write(frame);
     } finally {
       res.end();
     }
@@ -364,7 +385,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   } catch {
     return refused(res, 'openai', [...failures, { status: 502, code: 'bad_upstream_json', model }]);
   }
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model), failureHeaders(failures));
+  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model, openAIPromptText(body)), failureHeaders(failures));
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back, with failover. */
@@ -383,7 +404,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
       ...failureHeaders(failures),
     });
     try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, model)) res.write(event);
+      for await (const event of anthropicEventsFromOpenAI(upstream.body, model, anthropicPromptText(body))) res.write(event);
     } finally {
       res.end();
     }
@@ -395,7 +416,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   } catch {
     return refused(res, 'anthropic', [...failures, { status: 502, code: 'bad_upstream_json', model }]);
   }
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model), failureHeaders(failures));
+  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model, anthropicPromptText(body)), failureHeaders(failures));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

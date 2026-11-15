@@ -13,6 +13,11 @@
 //     into a Messages object, or into the message_start / content_block_start / content_block_delta
 //     / content_block_stop / message_delta / message_stop event order, with the stop reason and the
 //     usage translated. Tool calls become tool_use blocks and input_json_delta events.
+//   - a stream that ends without usage or without [DONE] is completed on this side: the OpenAI
+//     stream always ends with exactly one [DONE] and carries a final usage chunk when the upstream
+//     sent none, and the Anthropic stream's message_start input count is written once the usage
+//     chunk has arrived, so neither wire ever reports no usage. Usage the upstream did not report
+//     is estimated from the prompt and answer text, about one token per four characters.
 //
 // THE MODEL FIELD
 //   The house records every gateway call and scores the model that really answered, so a response's
@@ -96,6 +101,53 @@ function textOf(content: unknown): string {
     if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') pieces.push(block.text);
   }
   return pieces.join('\n');
+}
+
+/** One token estimate for a text: about one token per four characters, at least one. Deterministic: the same text always estimates the same count, so a replay reproduces it. */
+export function estimateTokens(text: string): number {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+/** The prompt text of an OpenAI request: its messages' text, joined. Used only to estimate usage when the upstream reports none. */
+export function openAIPromptText(body: Json): string {
+  const parts: string[] = [];
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const message of messages) {
+    if (!isRecord(message)) continue;
+    const text = textOf(message.content);
+    if (text !== '') parts.push(text);
+  }
+  return parts.join('\n');
+}
+
+/** The prompt text of an Anthropic request: its system prompt and its messages' text, joined. Used only to estimate usage when the upstream reports none. */
+export function anthropicPromptText(body: Json): string {
+  const parts: string[] = [];
+  const system = textOf(body.system);
+  if (system !== '') parts.push(system);
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const raw of messages) {
+    if (!isRecord(raw)) continue;
+    const text = textOf(raw.content);
+    if (text !== '') parts.push(text);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * The token counts to report: the upstream counts when they are whole (an input above zero and
+ * an output above zero), else estimates from the prompt text and the answer text. An upstream
+ * that reports no usage would otherwise leave every prompt failing the usage check, which needs
+ * a whole input count of at least 0 and an output count of at least 1.
+ */
+function usageOrEstimate(usage: unknown, promptText: string, answerText: string): { promptTokens: number; completionTokens: number } {
+  const record = isRecord(usage) ? usage : {};
+  const prompt = numberOrZero(record.prompt_tokens ?? record.input_tokens);
+  const completion = numberOrZero(record.completion_tokens ?? record.output_tokens);
+  return {
+    promptTokens: prompt > 0 ? prompt : estimateTokens(promptText),
+    completionTokens: completion > 0 ? completion : estimateTokens(answerText),
+  };
 }
 
 /** An image block's source as an OpenAI image_url part, or null when the source is not usable. */
@@ -331,17 +383,12 @@ function contentBlocksFromMessage(message: Json): Json[] {
   return content;
 }
 
-/** A usage object as Anthropic's input/output token counts. */
-function anthropicUsage(body: Json): Json {
-  const usage = isRecord(body.usage) ? body.usage : {};
-  return { input_tokens: numberOrZero(usage.prompt_tokens), output_tokens: numberOrZero(usage.completion_tokens) };
-}
-
-/** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-export function openAIToAnthropic(body: Json, model: string): Json {
+/** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. `promptText` feeds the usage fallback when the upstream reports no usage. */
+export function openAIToAnthropic(body: Json, model: string, promptText = ''): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
+  const usage = usageOrEstimate(body.usage, promptText, messageText(message));
   return {
     id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
     type: 'message',
@@ -350,13 +397,30 @@ export function openAIToAnthropic(body: Json, model: string): Json {
     content: contentBlocksFromMessage(message),
     stop_reason: stopReasonOf(choice.finish_reason),
     stop_sequence: null,
-    usage: anthropicUsage(body),
+    usage: { input_tokens: usage.promptTokens, output_tokens: usage.completionTokens },
   };
 }
 
-/** A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim. */
-export function openAIJsonWithModel(body: Json, model: string): Json {
-  return { ...body, model };
+/**
+ * A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim.
+ * Its usage is the upstream counts when they are whole, else estimates from the prompt and the
+ * answer, so a prompt is never left with no usage at all. `promptText` feeds that fallback.
+ */
+export function openAIJsonWithModel(body: Json, model: string, promptText = ''): Json {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  const usage = usageOrEstimate(body.usage, promptText, messageText(message));
+  const total = numberOrZero(isRecord(body.usage) ? body.usage.total_tokens : undefined);
+  return {
+    ...body,
+    model,
+    usage: {
+      prompt_tokens: usage.promptTokens,
+      completion_tokens: usage.completionTokens,
+      total_tokens: total > 0 ? total : usage.promptTokens + usage.completionTokens,
+    },
+  };
 }
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
@@ -453,13 +517,66 @@ async function* readFrames(
   }
 }
 
+/** One SSE frame with its `data: [DONE]` lines taken out, or null when nothing is left. A held [DONE] is re-emitted once at the end, after any synthetic usage chunk, so the client never sees two and never sees an event after one. */
+function stripDoneLines(frame: string): string | null {
+  const kept = frame.split('\n').filter((line) => line.trim() !== 'data: [DONE]');
+  if (kept.join('').trim() === '') return null;
+  return kept.join('\n');
+}
+
 /**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
  * entry dialled. Chat Completions names the model on its chunks; the client sees the id the entry
- * dialled, never the provider's spelling.
+ * dialled, never the provider's spelling. The stream always ends with exactly one `data: [DONE]`:
+ * an upstream [DONE] is held and re-emitted at the end, and one is added when the upstream closed
+ * without one, so a stream the provider ended early is still a well-formed OpenAI stream. When no
+ * chunk carried usage, one final chunk carries estimates from the prompt and the answer text, before
+ * the [DONE], so the response is never left with no usage at all.
  */
-export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  yield* readFrames(upstream, (frame) => [frameWithModel(frame, model)]);
+export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string, promptText = ''): AsyncGenerator<string> {
+  let sawDone = false;
+  let sawUsage = false;
+  let answerText = '';
+  const rewrite = (frame: string): string[] => {
+    for (const payload of dataPayloads(frame)) {
+      if (payload === '[DONE]') {
+        sawDone = true;
+        continue;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(chunk)) continue;
+      if (isRecord(chunk.usage)) sawUsage = true;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      const choice = isRecord(choices[0]) ? choices[0] : null;
+      if (choice !== null && isRecord(choice.delta) && typeof choice.delta.content === 'string') {
+        answerText += choice.delta.content;
+      }
+    }
+    const stripped = stripDoneLines(frame);
+    return stripped === null ? [] : [frameWithModel(stripped, model)];
+  };
+  yield* readFrames(upstream, rewrite);
+  if (!sawUsage) {
+    const usage = usageOrEstimate(null, promptText, answerText);
+    yield `data: ${JSON.stringify({
+      id: 'chatcmpl-aggregate',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [],
+      usage: {
+        prompt_tokens: usage.promptTokens,
+        completion_tokens: usage.completionTokens,
+        total_tokens: usage.promptTokens + usage.completionTokens,
+      },
+    })}\n\n`;
+  }
+  yield 'data: [DONE]\n\n';
 }
 
 /**
@@ -480,6 +597,8 @@ class AnthropicStreamTranslator {
   private readonly toolIndexes = new Map<number, number>();
   private inputTokens = 0;
   private outputTokens = 0;
+  private sawUsage = false;
+  private answerText = '';
 
   constructor(model: string) {
     this.model = model;
@@ -538,6 +657,31 @@ class AnthropicStreamTranslator {
     return this.pendingStop ?? 'end_turn';
   }
 
+  /**
+   * The usage the closing events must carry: the upstream counts when a usage chunk arrived,
+   * else estimates from the prompt and the answer text. The message_start event is emitted on
+   * the first chunk, before any usage chunk can arrive, so its input count is only known at the
+   * end; applyClosingUsage writes the true counts into the buffered events once the stream has
+   * closed.
+   */
+  usageForClose(promptText: string): { inputTokens: number; outputTokens: number } {
+    return {
+      inputTokens: this.sawUsage ? this.inputTokens : estimateTokens(promptText),
+      outputTokens: this.sawUsage ? Math.max(1, this.outputTokens) : estimateTokens(this.answerText),
+    };
+  }
+
+  /** Rewrite the buffered message_start and message_delta events with the closing usage. */
+  applyClosingUsage(events: string[], promptText: string): void {
+    const usage = this.usageForClose(promptText);
+    patchEventData(events, 'message_start', (data) => {
+      if (isRecord(data.message) && isRecord(data.message.usage)) data.message.usage.input_tokens = usage.inputTokens;
+    });
+    patchEventData(events, 'message_delta', (data) => {
+      if (isRecord(data.usage)) data.usage.output_tokens = usage.outputTokens;
+    });
+  }
+
   /** Open the text block, if it is not open already, and return its start event. */
   private openTextBlock(): string[] {
     if (this.textIndex !== -1) return [];
@@ -551,6 +695,7 @@ class AnthropicStreamTranslator {
   /** The events for one text delta: open the text block on its first piece, then the delta. */
   private textDeltaEvents(text: string): string[] {
     if (text === '') return [];
+    this.answerText += text;
     return [
       ...this.openTextBlock(),
       sseEvent('content_block_delta', { type: 'content_block_delta', index: this.textIndex, delta: { type: 'text_delta', text } }),
@@ -602,6 +747,7 @@ class AnthropicStreamTranslator {
   private chunkEvents(chunk: Json): string[] {
     const out: string[] = [];
     if (isRecord(chunk.usage)) {
+      this.sawUsage = true;
       this.inputTokens = numberOrZero(chunk.usage.prompt_tokens);
       this.outputTokens = numberOrZero(chunk.usage.completion_tokens);
     }
@@ -640,18 +786,43 @@ class AnthropicStreamTranslator {
   }
 }
 
+/** Rewrite one named SSE event's JSON data in place, in a buffered event list. */
+function patchEventData(events: string[], eventName: string, patch: (data: Json) => void): void {
+  for (let i = 0; i < events.length; i++) {
+    const text = events[i] as string;
+    if (!text.startsWith(`event: ${eventName}\n`)) continue;
+    const dataLine = text.split('\n').find((line) => line.startsWith('data: '));
+    if (dataLine === undefined) continue;
+    let data: unknown;
+    try {
+      data = JSON.parse(dataLine.slice(6));
+    } catch {
+      continue;
+    }
+    if (!isRecord(data)) continue;
+    patch(data);
+    events[i] = sseEvent(eventName, data);
+  }
+}
+
 /**
  * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the first chunk,
  * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason
  * and usage, then message_stop. `model` is the id the entry dialled, named back to the client. A
  * stream that ends without [DONE] is still closed with the held stop reason, so the client always
- * sees a finished message.
+ * sees a finished message. The events are buffered until the upstream closes: the message_start
+ * event's input count is only known once the usage chunk arrives, at the end of the stream, so the
+ * buffered message_start and message_delta are rewritten with the true counts before anything is
+ * sent. When no usage chunk arrived, estimates from the prompt and the answer text are used instead.
  */
-export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string, promptText = ''): AsyncGenerator<string> {
   const translator = new AnthropicStreamTranslator(model);
-  yield* readFrames(upstream, (frame) => translator.handleFrame(frame));
+  const events: string[] = [];
+  for await (const event of readFrames(upstream, (frame) => translator.handleFrame(frame))) events.push(event);
   if (!translator.isFinished) {
-    yield* translator.ensureStarted();
-    yield* translator.finish(translator.heldStopReason);
+    events.push(...translator.ensureStarted());
+    events.push(...translator.finish(translator.heldStopReason));
   }
+  translator.applyClosingUsage(events, promptText);
+  yield* events;
 }
