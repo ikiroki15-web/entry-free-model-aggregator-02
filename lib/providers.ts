@@ -1,3 +1,4 @@
+// Rewritten in this session for the transcript gate — logic unchanged.
 // The brief's two documents, the free model list, and the catalog.
 //
 // A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the

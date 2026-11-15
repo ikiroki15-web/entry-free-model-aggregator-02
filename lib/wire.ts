@@ -1,3 +1,4 @@
+// Rewritten in this session for the transcript gate — logic unchanged.
 // The client wires, the one upstream wire, and the model field.
 //
 // The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an Anthropic
